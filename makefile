@@ -1,14 +1,16 @@
 # Compiler and tools
 CC := gcc
-CFLAGS := -Wall -Wextra
+CFLAGS := -Wall
 
 DEBUG_FLAGS := -g -O0
 RELEASE_FLAGS := -O3
 
 SQLITE_LIBS := -lpthread -ldl -lm
+OPENSSL_LIBS := -lssl -lcrypto -lpthread
 
 # Directories
 BUILD_DIR := build
+CERT_DIR := certs
 OBJ_DIR := $(BUILD_DIR)/obj
 DEBUG_DIR := $(BUILD_DIR)/debug
 RELEASE_DIR := $(BUILD_DIR)/release
@@ -49,24 +51,26 @@ shell:  $(SHELL_REL)
 # Debug executables
 $(CLIENT_DBG): $(CLIENT_OBJS_DBG)
 	@mkdir -p $(DEBUG_DIR)
-	$(CC) -o $@ $^
+	$(CC) -o $@ $^ $(OPENSSL_LIBS)
 
 $(SERVER_DBG): $(SERVER_OBJS_DBG)
 	@mkdir -p $(DEBUG_DIR)
-	$(CC) -o $@ $^ $(SQLITE_LIBS)
+	$(CC) -o $@ $^ $(SQLITE_LIBS) $(OPENSSL_LIBS)
+	./cert.sh
 
 # Release executables
 $(CLIENT_REL): $(CLIENT_OBJS_REL)
 	@mkdir -p $(RELEASE_DIR)
-	$(CC) -o $@ $^
+	$(CC) -o $@ $^ $(OPENSSL_LIBS)
 
 $(SERVER_REL): $(SERVER_OBJS_REL)
 	@mkdir -p $(RELEASE_DIR)
-	$(CC) -o $@ $^ $(SQLITE_LIBS)
+	$(CC) -o $@ $^ $(SQLITE_LIBS) $(OPENSSL_LIBS)
 
 $(SHELL_REL): $(SHELL_OBJS_REL)
 	@mkdir -p $(RELEASE_DIR)
-	$(CC) -o $@ $^
+	$(CC) -o $@ $^ $(SQLITE_LIBS)
+	./cert.sh
 
 # Object file rules
 $(OBJ_DIR)/%.o: %.c
@@ -89,4 +93,10 @@ $(OBJ_DIR)/shell.o: shell.c
 
 clean:
 	rm -rf $(BUILD_DIR)
+	rm -rf $(CERT_DIR)
+
+cleanexec:
+	rm -rf $(BUILD_DIR)/debug
+	rm -rf $(BUILD_DIR)/release
+	rm -rf $(CERT_DIR)
 
