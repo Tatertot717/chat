@@ -2,18 +2,19 @@
 CC := gcc
 CFLAGS := -Wall
 
-DEBUG_FLAGS := -g -O0
-RELEASE_FLAGS := -O3
+DEBUG_FLAGS := -g -Og
+RELEASE_FLAGS := -O3 -march=native
 
 SQLITE_LIBS := -lpthread -ldl -lm
 OPENSSL_LIBS := -lssl -lcrypto -lpthread
 
-# Directories
+# Definitions
 BUILD_DIR := build
 CERT_DIR := certs
 OBJ_DIR := $(BUILD_DIR)/obj
 DEBUG_DIR := $(BUILD_DIR)/debug
 RELEASE_DIR := $(BUILD_DIR)/release
+SERVER_DB := server.db
 
 # Source files
 CLIENT_SRC := client.c
@@ -88,15 +89,17 @@ $(OBJ_DIR)/sqlite3.o: sqlite3.c
 
 $(OBJ_DIR)/shell.o: shell.c
 	@mkdir -p $(OBJ_DIR)
-	$(CC) $(CFLAGS) -D_DEFAULT_SOURCE $(RELEASE_FLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(RELEASE_FLAGS) -c -o $@ $<
 
 
 clean:
 	rm -rf $(BUILD_DIR)
 	rm -rf $(CERT_DIR)
+	rm -rf $(SERVER_DB)
 
 cleanexec:
 	rm -rf $(BUILD_DIR)/debug
 	rm -rf $(BUILD_DIR)/release
 	rm -rf $(CERT_DIR)
+	rm -rf $(SERVER_DB)
 
