@@ -8,9 +8,11 @@
 
 typedef enum {
 	INITIAL,
-	WAITING_USERNAME,
-	WAITING_PASSWORD,
-	CONFIRM_PASSWORD,
+	CREATE_USERNAME,
+	CREATE_PASSWORD,
+	CREATE_CONFIRM_PASSWORD,
+	LOGIN_USERNAME,
+	LOGIN_PASSWORD,
 	AUTHENTICATED
 } ClientState;
 
@@ -21,10 +23,10 @@ typedef struct Client {
 	char buffer[1024];
 	int buffer_len;
 	char username[21];
-	char password[31];
+	char password[32];
 	in_addr_t address;
 	bool active;
-
+	char login_attempts;
 } Client;
 
 typedef struct Task {
