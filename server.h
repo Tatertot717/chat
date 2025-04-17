@@ -1,15 +1,17 @@
 #ifndef SERVER_H
 #define SERVER_H
 #include <stdbool.h>
+#include <netinet/in.h>
 #include <openssl/types.h>
 
 #endif //SERVER_H
 
 typedef enum {
-	INITIAL, //i
-	CREATE_LOGIN, //c
-	WAITING_FOR_PASSWORD, //l
-	AUTHENTICATED //a
+	INITIAL,
+	WAITING_USERNAME,
+	WAITING_PASSWORD,
+	CONFIRM_PASSWORD,
+	AUTHENTICATED
 } ClientState;
 
 typedef struct Client {
@@ -18,7 +20,11 @@ typedef struct Client {
 	ClientState state;
 	char buffer[1024];
 	int buffer_len;
+	char username[21];
+	char password[31];
+	in_addr_t address;
 	bool active;
+
 } Client;
 
 typedef struct Task {

@@ -18,6 +18,8 @@
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
 
 #define PORT 4400
 #define MAX_CLIENTS 50
@@ -54,7 +56,13 @@ int main() {
 
 	int server_fd = socket(AF_INET, SOCK_STREAM, 0);
 	struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(PORT), .sin_addr.s_addr = INADDR_ANY};
-	bind(server_fd, (struct sockaddr *) &addr, sizeof(addr));
+	if (bind(server_fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+		fprintf(stderr, "[!] Socket binding failed, is port already in use?\n");
+		SSL_CTX_free(ssl_ctx);
+		close(server_fd);
+		sqlite3_close(db);
+		return EXIT_FAILURE;
+	}
 	listen(server_fd, 10);
 	make_non_blocking(server_fd);
 
@@ -93,6 +101,172 @@ int main() {
 	return 0;
 }
 
+//true if exists, false if not.
+int check_username(const char *username) {
+	sqlite3_stmt *stmt;
+	const char *sql = "SELECT 1 FROM users WHERE username = ? LIMIT 1;";
+
+	if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+		fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(db));
+		return -1; //something broke
+	}
+
+	sqlite3_bind_text(stmt, 1, username, -1, SQLITE_STATIC);
+
+	int exists = 0;
+	if (sqlite3_step(stmt) == SQLITE_ROW) {
+		exists = 1;  // username exists
+	}
+
+	sqlite3_finalize(stmt);
+	return exists;
+}
+
+int hash_and_salt(char *password, const unsigned char *salt) {
+	int iterations = 100000;
+	int keylen = 32;
+	unsigned char hash[32];
+
+	if (PKCS5_PBKDF2_HMAC(password, strlen(password), salt, strlen((char *)salt),
+						  iterations, EVP_sha256(), keylen, hash) != 1) {
+		fprintf(stderr, "Error during PBKDF2\n");
+		return 1;
+						  }
+
+	printf("Derived key: ");
+	for (int i = 0; i < keylen; i++)
+		printf("%02x", hash[i]);
+	printf("\n");
+	strcpy(password, hash);
+
+	return 0;
+}
+
+
+int create_user(const char *username, char *password) {
+	sqlite3_stmt *stmt;
+	const char *sql = "INSERT INTO users (username, password_hash, password_salt, last_online) VALUES (?, ?, ?, CURRENT_TIMESTAMP);";
+
+	if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+		fprintf(stderr, "Prepare failed: %s\n", sqlite3_errmsg(db));
+		return -1;
+	}
+
+	sqlite3_bind_text(stmt, 1, username, -1, SQLITE_STATIC);
+
+	const unsigned char salt[16];
+	RAND_bytes(salt, 16);
+	hash_and_salt(password, salt);
+
+	sqlite3_bind_text(stmt, 2, password, -1, SQLITE_STATIC);
+	sqlite3_bind_text(stmt, 3, salt, -1, SQLITE_STATIC);
+
+	int result = 0;
+	if (sqlite3_step(stmt) != SQLITE_DONE) {
+		fprintf(stderr, "Insert failed: %s\n", sqlite3_errmsg(db));
+		result = -1;
+	}
+
+	sqlite3_finalize(stmt);
+	return result;
+}
+
+void disconnect_client(Client *client, const char *reason) {
+	int index = -1;
+	for (int i = 0; i < client_count; ++i) {
+		if (&clients[i] == client) {
+			index = i;
+			break;
+		}
+	}
+	if (index != -1) {
+		if (reason) SSL_write(client->ssl, reason, (int)strlen(reason));
+		remove_client(index);
+	}
+}
+
+
+bool login_or_signup(Client *client) {
+	//signup
+	if (client->buffer[0] == 's') {
+		if (client->state == INITIAL) {
+			SSL_write(client->ssl, "sEnter new username:\n", 22);
+			client->state = WAITING_USERNAME;
+			return false;
+		}
+		if (client->state == WAITING_USERNAME) {
+			int unamelen = (int)strlen(client->buffer + 1);
+
+			if (client->buffer[unamelen] == '\n') {
+				client->buffer[unamelen] = '\0';
+				unamelen = unamelen - 1;
+			}
+
+			if (unamelen > 20) {
+				SSL_write(client->ssl, "sUsername too long! Try again.\nEnter new username:\n", 52);
+				return false;
+			}
+
+			if (check_username(client->buffer + 1) != 0) {
+				SSL_write(client->ssl, "sUsername exists! Try again.\nEnter new username:\n", 49);
+				return false;
+			}
+
+			strcpy(client->username, client->buffer + 1);
+			client->state = WAITING_PASSWORD;
+			SSL_write(client->ssl, "sEnter new password:\n", 22);
+			return false;
+		}
+		if (client->state == WAITING_PASSWORD) {
+			int passlen = (int)strlen(client->buffer + 1);
+			if (client->buffer[passlen] == '\n') {
+				client->buffer[passlen] = '\0';
+				passlen = passlen - 1;
+			}
+			if (passlen > 30) {
+				SSL_write(client->ssl, "sPassword too long! Try again.\nEnter new password:\n", 52);
+				return false;
+			}
+			strcpy(client->password, client->buffer + 1);
+			client->state = CONFIRM_PASSWORD;
+			SSL_write(client->ssl, "sConfirm password:\n", 20);
+			return false;
+		}
+		if (client->state == CONFIRM_PASSWORD) {
+			int passlen = (int)strlen(client->buffer + 1);
+			if (client->buffer[passlen] == '\n') {
+				client->buffer[passlen] = '\0';
+				passlen = passlen - 1;
+			}
+			if (passlen > 30) {
+				SSL_write(client->ssl, "sPasswords do not match! Try again.\nEnter new password:\n", 57);
+				memset(client->password, 0, sizeof(client->password));
+				client->state = WAITING_PASSWORD;
+				return false;
+			}
+			if (strcmp(client->password, client->buffer + 1) == 0) {
+				create_user(client->username, client->password);
+				memset(client->password, 0, sizeof(client->password)); //clear for security
+				client->state = AUTHENTICATED;
+				return true;
+			}
+			SSL_write(client->ssl, "sPasswords do not match! Try again.\nEnter new password:\n", 57);
+			memset(client->password, 0, sizeof(client->password));
+			client->state = WAITING_PASSWORD;
+			return false;
+		}
+	}
+
+	//login
+	if (client->buffer[0] == 'l') {
+		SSL_write(client->ssl, "sEnter new username:\n", 22);
+		client->state = AUTHENTICATED;
+		return true;
+	}
+
+	return false;
+}
+
 void *worker_thread(void *arg) {
 	while (!shutdown_requested) {
 		pthread_mutex_lock(&queue_mutex);
@@ -112,13 +286,19 @@ void *worker_thread(void *arg) {
 		Client *client = task.client;
 		if (!client->active) continue;
 
-		printf("[Worker] Handling message: %s\n", task.message);
+		//printf("[Worker] Handling message: %s\n", task.message);
 
-		if (client->state == INITIAL) {
-			SSL_write(client->ssl, "Welcome, authenticated!\n", 25);
-			client->state = AUTHENTICATED;
+		if (client->state == INITIAL || client->state == WAITING_USERNAME || \
+			client->state == WAITING_PASSWORD || client->state == CONFIRM_PASSWORD) {
+			if (login_or_signup(client)) {
+				char buffer[32]; // 21(max username) + 11 (text below)
+				snprintf(buffer, 32, "Welcome, %s!\n", client->username);
+				SSL_write(client->ssl, buffer, (int)strlen(buffer));
+				printf("[+] Client %d logged in as %s.\n",client->fd,client->username);
+				client->state = AUTHENTICATED;
+			}
 		} else if (client->state == AUTHENTICATED) {
-			SSL_write(client->ssl, "Command received.\n", 18);
+			SSL_write(client->ssl, "Command received.\n", 19);
 		}
 	}
 
@@ -145,7 +325,8 @@ void createopen_db() {
 	}
 	if (sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS users ( \
                       username TEXT PRIMARY KEY, \
-                      password_hash TEXT NOT NULL, \
+                      password_hash BLOB NOT NULL, \
+					  password_salt BLOB NOT NULL, \
                       last_online TIMESTAMP, \
                       active BOOLEAN NOT NULL DEFAULT 1);",NULL,NULL, &zErrMsg
 	    ) != SQLITE_OK) {
@@ -290,7 +471,7 @@ bool accept_incoming_connections(SSL_CTX *ssl_ctx, int server_fd) {
 			printf("[+] SSL handshake complete (fd: %d)\n", client_fd);
 			make_non_blocking(client_fd);
 
-			if (SSL_write(ssl, "Initial login state", 16) <= 0) {
+			if (SSL_write(ssl, "Welcome to the server!\nLogin or signup?\n", 42) <= 0) {
 				fprintf(stderr, "[!] SSL_write failed after handshake for fd %d:\n", client_fd);
 				ERR_print_errors_fp(stderr);
 				SSL_shutdown(ssl);
@@ -301,7 +482,17 @@ bool accept_incoming_connections(SSL_CTX *ssl_ctx, int server_fd) {
 				printf("[+] Prompt sent to client %d\n", client_fd);
 			}
 
-			clients[client_count] = (Client){client_fd, ssl, INITIAL, {0}, 0, true};
+			clients[client_count] = (Client){
+				.fd = client_fd,
+				.ssl = ssl,
+				.state = INITIAL,
+				.buffer = {0},
+				.buffer_len = 0,
+				.username = {0},
+				.password = {0},
+				.address = 0,
+				.active = true
+			};
 			fds[client_count + 1].fd = client_fd;
 			fds[client_count + 1].events = POLLIN;
 			client_count++;
