@@ -13,30 +13,40 @@ typedef enum {
 	CREATE_CONFIRM_PASSWORD,
 	LOGIN_USERNAME,
 	LOGIN_PASSWORD,
-	AUTHENTICATED
+	AUTHENTICATED,
+	IN_HANDOFF,
+	D_HANDOFF
 } ClientState;
 
-typedef struct Client {
-	int fd;
+typedef struct Client Client;
+
+struct Client {
 	SSL *ssl;
+	Client *handoff;
+	struct sockaddr_in address;
+	int fd;
 	ClientState state;
-	char buffer[1024];
 	int buffer_len;
-	char username[21];
-	char password[32];
-	in_addr_t address;
 	bool active;
 	char login_attempts;
-} Client;
+	char username[21];
+	char password[32];
+	char buffer[1024];
+};
 
 typedef struct Task {
 	Client *client;
 	char message[1024];
 } Task;
 
+typedef struct Broadcast{
+	char message[256];
+	time_t timestamp;
+} Broadcast;
+
 void handle_sigint(int sig);
 
-void createopen_db();
+void create_open_db();
 
 int shutdown_ssl_gracefully(SSL *ssl, int fd, int timeout_ms);
 
@@ -50,6 +60,10 @@ void enqueue_task(Task task);
 
 void queue_client_task(void);
 
-void *worker_thread(void *arg);
+void *worker_thread();
 
 bool accept_incoming_connections(SSL_CTX *ssl_ctx, int server_fd);
+
+void kick_idle_clients();
+
+void disconnect_client(Client *client, const char *reason);

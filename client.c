@@ -3,22 +3,76 @@
 #include <unistd.h>
 #include <string.h>
 #include <signal.h>
+#include <pthread.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
-#define SERVER_IP "127.0.0.1"
+#define SERVER_IP "172.28.0.10"
 #define SERVER_PORT 4400
+
+
+/* One byte letter message prefix status header
+ * i = initial
+ * s = signup flow
+ * l = login
+ * a = authenticated
+ * d = display clients
+ * b = broadcast to all active clients
+ * c = connection request to other client
+ * h = handoff flow
+ *
+ * e = error/exit
+ */
+
 
 void handle_ssl_error(const char *msg) {
     fprintf(stderr, "%s\n", msg);
     ERR_print_errors_fp(stderr);
 }
 
+void *udp_listener(void *arg) {
+    int udp_sock;
+    struct sockaddr_in udp_addr;
+    char udp_buffer[1024];
+
+    udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_sock < 0) {
+        perror("UDP socket creation failed");
+        pthread_exit(NULL);
+    }
+
+    memset(&udp_addr, 0, sizeof(udp_addr));
+    udp_addr.sin_family = AF_INET;
+    udp_addr.sin_addr.s_addr = INADDR_ANY;
+    udp_addr.sin_port = htons(SERVER_PORT);
+
+    if (bind(udp_sock, (struct sockaddr*)&udp_addr, sizeof(udp_addr)) < 0) {
+        perror("UDP bind failed");
+        close(udp_sock);
+        pthread_exit(NULL);
+    }
+
+    printf("[UDP] Listening for broadcasts on port %d...\n", SERVER_PORT);
+
+    while (1) {
+        socklen_t addrlen = sizeof(udp_addr);
+        ssize_t len = recvfrom(udp_sock, udp_buffer, sizeof(udp_buffer) - 1, 0,
+                               (struct sockaddr*)&udp_addr, &addrlen);
+        if (len > 0) {
+            udp_buffer[len] = '\0';
+            printf("%s\n", udp_buffer);
+            fflush(stdout);
+        }
+    }
+
+    close(udp_sock);
+    return NULL;
+}
+
 int main() {
-    // Prevent crashes on SIGPIPE (when writing to closed socket)
     signal(SIGPIPE, SIG_IGN);
 
     SSL_library_init();
@@ -31,6 +85,11 @@ int main() {
         return 1;
     }
 
+    // Start UDP listener thread
+    pthread_t udp_thread;
+    pthread_create(&udp_thread, NULL, udp_listener, NULL);
+
+    // TCP/SSL part
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in server_addr = {
         .sin_family = AF_INET,
@@ -56,42 +115,38 @@ int main() {
         return 1;
     }
 
-    char buffer[1024];
+    char buffer[4096];
 
-    // Read initial server prompt
+    // Initial server message
     int bytes = SSL_read(ssl, buffer, sizeof(buffer) - 1);
     if (bytes > 0) {
         buffer[bytes] = '\0';
         printf("Server: %s", buffer);
     } else {
         handle_ssl_error("Failed to read server prompt");
-        SSL_shutdown(ssl);
-        SSL_free(ssl);
-        close(sock);
-        SSL_CTX_free(ctx);
-        return 1;
-    }
-
-    // Send a username
-    printf("Enter username to send: ");
-    if (fgets(buffer, sizeof(buffer), stdin) == NULL) {
-        printf("Input error.\n");
         goto cleanup;
     }
 
-    int sent = SSL_write(ssl, buffer, strlen(buffer));
-    if (sent <= 0) {
-        handle_ssl_error("SSL_write failed");
-        goto cleanup;
-    }
+    while (1) {
+        printf("\nEnter message (prefix 'l' for login, 's' for signup, 'b' to broadcast): ");
+        if (fgets(buffer, sizeof(buffer), stdin) == NULL) break;
 
-    // Read response from server
-    bytes = SSL_read(ssl, buffer, sizeof(buffer) - 1);
-    if (bytes > 0) {
-        buffer[bytes] = '\0';
-        printf("Server: %s", buffer);
-    } else {
-        handle_ssl_error("Failed to read server response");
+        if (strncmp(buffer, "exit", 4) == 0) break;
+
+        int sent = SSL_write(ssl, buffer, strlen(buffer));
+        if (sent <= 0) {
+            handle_ssl_error("SSL_write failed");
+            break;
+        }
+
+        bytes = SSL_read(ssl, buffer, sizeof(buffer) - 1);
+        if (bytes > 0) {
+            buffer[bytes] = '\0';
+            printf("Server: %s", buffer);
+        } else {
+            handle_ssl_error("SSL_read failed");
+            break;
+        }
     }
 
 cleanup:

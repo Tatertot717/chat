@@ -1,0 +1,42 @@
+networks:
+  testnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: chatimage:latest
+    container_name: chat_server
+    command: ./server
+    working_dir: /app
+    tty: true
+    stdin_open: true
+    networks:
+      testnet:
+        ipv4_address: 172.28.0.10
+    ports:
+      - "4400:4400/tcp"
+      - "4400:4400/udp"
+    volumes:
+      - ./build/debug:/app
+      - ./certs:/app/certs
+
+  client:
+    image: chatimage:latest
+    command: tail -f /dev/null
+    working_dir: /app
+    networks:
+      - testnet
+    volumes:
+      - ./build/debug:/app
+    depends_on:
+      - server
+    tty: true
+    stdin_open: true
+    deploy:
+      replicas: 2

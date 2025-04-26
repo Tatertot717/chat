@@ -5,11 +5,11 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <errno.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -27,6 +27,9 @@
 #define MAX_TASKS 100
 #define SERVER_CERT "./certs/server.crt"
 #define SERVER_KEY "./certs/server.key"
+#define MAX_BROADCASTS 100
+#define BROADCAST_LIFETIME 1800
+#define IDLE_TIMEOUT 3600
 
 Client clients[MAX_CLIENTS];
 struct pollfd fds[MAX_CLIENTS + 1];
@@ -35,6 +38,10 @@ volatile sig_atomic_t shutdown_requested = 0;
 
 Task task_queue[MAX_TASKS];
 int task_front = 0, task_rear = 0;
+
+int udp_broadcast;
+Broadcast broadcasts[MAX_BROADCASTS];
+int broadcast_count = 0;
 
 pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
@@ -53,17 +60,37 @@ int main() {
 	SSL_CTX_set_min_proto_version(ssl_ctx, TLS1_2_VERSION);
 	SSL_CTX_set_max_proto_version(ssl_ctx, TLS1_3_VERSION);
 
-	createopen_db();
+	create_open_db();
 
-	int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+	const int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (udp_broadcast < 0) {
+		perror("TCP socket creation failed");
+		exit(EXIT_FAILURE);
+	}
+	udp_broadcast = socket(AF_INET, SOCK_DGRAM, 0);
+	if (udp_broadcast < 0) {
+		perror("UDP socket creation failed");
+		exit(EXIT_FAILURE);
+	}
 	struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(PORT), .sin_addr.s_addr = INADDR_ANY};
 	if (bind(server_fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
-		fprintf(stderr, "[!] Socket binding failed, is port already in use?\n");
+		fprintf(stderr, "[!] TCP Socket binding failed, is port already in use?\n");
 		SSL_CTX_free(ssl_ctx);
+		close(server_fd);
+		close(udp_broadcast);
+		sqlite3_close(db);
+		return EXIT_FAILURE;
+	}
+	if (bind(udp_broadcast, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+		fprintf(stderr, "[!] UDP Socket binding failed, is port already in use?\n");
+		SSL_CTX_free(ssl_ctx);
+		close(udp_broadcast);
 		close(server_fd);
 		sqlite3_close(db);
 		return EXIT_FAILURE;
 	}
+
+
 	listen(server_fd, 10);
 	make_non_blocking(server_fd);
 
@@ -84,6 +111,7 @@ int main() {
 		if (accept_incoming_connections(ssl_ctx, server_fd)) continue;
 
 		queue_client_task();
+		kick_idle_clients();
 	}
 
 	for (int i = 0; i < THREAD_POOL_SIZE; ++i) {
@@ -92,14 +120,218 @@ int main() {
 
 	printf("[*] Shutting down. Disconnecting all clients...\n");
 	for (int i = client_count - 1; i >= 0; i--) {
-		SSL_write(clients[i].ssl, "Server shutting down. Goodbye!\n", 33);
+		SSL_write(clients[i].ssl, "eServer shutting down. Goodbye!\n", 33);
 		remove_client(i);
 	}
 
 	SSL_CTX_free(ssl_ctx);
 	close(server_fd);
+	close(udp_broadcast);
 	sqlite3_close(db);
 	return 0;
+}
+
+
+void display_clients(const Client *client) {
+	char list[4096] = "d[";
+	bool first = true;
+
+	pthread_mutex_lock(&client_mutex);
+	for (int i = 0; i < client_count; i++) {
+		if (clients[i].active && clients[i].username[0] != '\0' && &clients[i] != client) {
+			if (!first) {
+				strcat(list, ",");
+			}
+			char entry[128];
+			snprintf(entry, sizeof(entry),
+				"{\"username\":\"%s\",\"ip\":\"%s\"}",
+				clients[i].username,
+				inet_ntoa(clients[i].address.sin_addr)
+			);
+			strcat(list, entry);
+			first = false;
+		}
+	}
+	pthread_mutex_unlock(&client_mutex);
+
+	strcat(list, "]\n");
+	SSL_write(client->ssl, list, (int)strlen(list));
+}
+
+
+void update_activity(const char *username) {
+	sqlite3_stmt *stmt;
+	const char *sql = "UPDATE users SET last_activity = CURRENT_TIMESTAMP WHERE username = ?;";
+
+	if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+		fprintf(stderr, "[!] Failed to prepare statement: %s\n", sqlite3_errmsg(db));
+		return;
+	}
+
+	if (sqlite3_bind_text(stmt, 1, username, -1, SQLITE_STATIC) != SQLITE_OK) {
+		fprintf(stderr, "[!] Failed to bind username: %s\n", sqlite3_errmsg(db));
+		sqlite3_finalize(stmt);
+		return;
+	}
+
+	if (sqlite3_step(stmt) != SQLITE_DONE) {
+		fprintf(stderr, "[!] Failed to execute statement: %s\n", sqlite3_errmsg(db));
+	} else {
+		//printf("Updated last_activity for user '%s'.\n", username);
+	}
+
+	sqlite3_finalize(stmt);
+}
+
+void kick_idle_clients() {
+	sqlite3_stmt *stmt;
+	const char *sql = "SELECT username FROM users "
+					  "WHERE active = 1 "
+					  "AND last_activity IS NOT NULL "
+					  "AND (strftime('%s','now') - strftime('%s', last_activity)) > ?;";
+
+	if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+		fprintf(stderr, "[!] Failed to prepare idle check query: %s\n", sqlite3_errmsg(db));
+		return;
+	}
+
+	sqlite3_bind_int(stmt, 1, IDLE_TIMEOUT);
+
+	pthread_mutex_lock(&client_mutex);
+
+	while (sqlite3_step(stmt) == SQLITE_ROW) {
+		const char *username = (const char *)sqlite3_column_text(stmt, 0);
+
+		for (int i = 0; i < client_count; i++) {
+			if (clients[i].active && strcmp(clients[i].username, username) == 0) {
+				printf("[!] Disconnecting idle client %s (timeout).\n", username);
+				disconnect_client(&clients[i], "eDisconnected due to inactivity.\n");
+				break; // since client list shifts after remove_client()
+			}
+		}
+	}
+
+	pthread_mutex_unlock(&client_mutex);
+
+	sqlite3_finalize(stmt);
+}
+
+
+
+void db_client_inactive(const char *username) {
+	sqlite3_stmt *stmt;
+	const char *sql = "UPDATE users SET active = 0 WHERE username = ?;";
+
+	if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+		fprintf(stderr, "[!] Failed to prepare statement to mark user inactive: %s\n", sqlite3_errmsg(db));
+		return;
+	}
+
+	sqlite3_bind_text(stmt, 1, username, -1, SQLITE_STATIC);
+
+	if (sqlite3_step(stmt) != SQLITE_DONE) {
+		fprintf(stderr, "[!] Failed to update user status: %s\n", sqlite3_errmsg(db));
+	} else {
+		//printf("[*] Marked user '%s' as inactive in the database.\n", username);
+	}
+
+	sqlite3_finalize(stmt);
+}
+
+
+void db_client_active(const char *username) {
+	sqlite3_stmt *stmt;
+	const char *sql = "UPDATE users SET active = 1 WHERE username = ?;";
+
+	if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+		fprintf(stderr, "[!] Failed to prepare statement to mark user inactive: %s\n", sqlite3_errmsg(db));
+		return;
+	}
+
+	sqlite3_bind_text(stmt, 1, username, -1, SQLITE_STATIC);
+
+	if (sqlite3_step(stmt) != SQLITE_DONE) {
+		fprintf(stderr, "[!] Failed to update user status: %s\n", sqlite3_errmsg(db));
+	} else {
+		//printf("[*] Marked user '%s' as inactive in the database.\n", username);
+	}
+
+	sqlite3_finalize(stmt);
+}
+
+
+void cleanup_broadcasts() {
+	const time_t now = time(NULL);
+	int new_count = 0;
+
+	for (int i = 0; i < broadcast_count; ++i) {
+		if (now - broadcasts[i].timestamp <= BROADCAST_LIFETIME) {
+			broadcasts[new_count++] = broadcasts[i];
+		}
+	}
+	broadcast_count = new_count;
+}
+
+
+void store_broadcast(const char *sender, const char *msg_body) {
+	const time_t now = time(NULL);
+	const struct tm *local = localtime(&now);
+	char time_str[16];
+	strftime(time_str, sizeof(time_str), "%-m/%-d %H:%M", local);
+	char full_msg[256];
+	snprintf(full_msg, sizeof(full_msg), "b[%s %s] %s\n", sender, time_str, msg_body);
+
+	if (broadcast_count < MAX_BROADCASTS) {
+		snprintf(broadcasts[broadcast_count].message, sizeof(broadcasts[0].message), "%s", full_msg);
+		broadcasts[broadcast_count].timestamp = now;
+		broadcast_count++;
+	}
+
+	// Cleanup
+	cleanup_broadcasts();
+}
+
+
+void send_broadcasts(Client *target, bool send_to_all, const char *single_message) {
+	cleanup_broadcasts();
+
+	pthread_mutex_lock(&client_mutex);
+	time_t now = time(NULL);
+
+	if (send_to_all) {
+		for (int i = 0; i < client_count; ++i) {
+			if (clients[i].active && clients[i].username[0] != 0)  {
+				struct sockaddr_in udp_addr = clients[i].address;
+				udp_addr.sin_port = htons(PORT);
+				sendto(udp_broadcast, single_message, strlen(single_message), 0,
+					   (struct sockaddr *)&udp_addr, sizeof(udp_addr));
+			}
+		}
+	} else {
+		if (!target || !target->active) {
+			pthread_mutex_unlock(&client_mutex);
+			return;
+		}
+
+		for (int i = 0; i < broadcast_count; ++i) {
+			if (now - broadcasts[i].timestamp <= BROADCAST_LIFETIME) {
+				struct sockaddr_in udp_addr = target->address;
+				udp_addr.sin_port = htons(PORT);
+				sendto(udp_broadcast, broadcasts[i].message, strlen(broadcasts[i].message), 0,
+					   (struct sockaddr *)&udp_addr, sizeof(udp_addr));
+			}
+		}
+	}
+
+	pthread_mutex_unlock(&client_mutex);
+}
+
+
+void broadcast_message(Client *sender, const char *msg_body) {
+	printf("[+] User %s broadcasting: %s", sender->username, msg_body);
+
+	store_broadcast(sender->username, msg_body);
+	send_broadcasts(NULL, true, broadcasts[broadcast_count - 1].message);
 }
 
 //true if exists, false if not.
@@ -313,7 +545,7 @@ bool login_or_signup(Client *client) {
 				client->state = LOGIN_USERNAME;
 				client->login_attempts = client->login_attempts + 1;
 				if (client->login_attempts == 3) {
-					disconnect_client(client, "Too many login attempts!\n");
+					disconnect_client(client, "eToo many login attempts!\n");
 				}
 				return false;
 			}
@@ -324,19 +556,21 @@ bool login_or_signup(Client *client) {
 				client->state = LOGIN_USERNAME;
 				client->login_attempts = client->login_attempts + 1;
 				if (client->login_attempts == 3) {
-					disconnect_client(client, "Too many login attempts!\n");
+					disconnect_client(client, "eToo many login attempts!\n");
 				}
 				return false;
 			}
 
 			if (check_password(client->username, client->password)) {
+				update_activity(client->username);
+				db_client_active(client->username);
 				return true;
 			}
 			SSL_write(client->ssl, "lIncorrect credentials! Try again.\nEnter username:\n", 52);
 			client->state = LOGIN_USERNAME;
 			client->login_attempts = client->login_attempts + 1;
 			if (client->login_attempts == 3) {
-				disconnect_client(client, "Too many login attempts!\n");
+				disconnect_client(client, "eToo many login attempts!\n");
 				return false;
 			}
 		}
@@ -345,7 +579,7 @@ bool login_or_signup(Client *client) {
 	return false;
 }
 
-void *worker_thread(void *arg) {
+void *worker_thread() {
 	while (!shutdown_requested) {
 		pthread_mutex_lock(&queue_mutex);
 		while (task_front == task_rear && !shutdown_requested) {
@@ -364,28 +598,109 @@ void *worker_thread(void *arg) {
 		Client *client = task.client;
 		if (!client->active) continue;
 
+		if (client->username[0] != 0) update_activity(client->username);
 		//printf("[Worker] Handling message: %s\n", task.message);
 
 		if (client->state == INITIAL || client->state == CREATE_USERNAME || \
 			client->state == CREATE_PASSWORD || client->state == CREATE_CONFIRM_PASSWORD || \
 			client->state == LOGIN_USERNAME || client->state == LOGIN_PASSWORD) {
 			if (login_or_signup(client)) {
-				char buffer[32]; // 21(max username) + 11 (text below)
-				snprintf(buffer, 32, "Welcome, %s!\n", client->username);
+				db_client_active(client->username);
+				char buffer[33]; // 21(max username) + 11 (text below)
+				snprintf(buffer, 33, "aWelcome, %s!\n", client->username);
 				SSL_write(client->ssl, buffer, (int)strlen(buffer));
 				printf("[+] Client %d logged in as %s.\n",client->fd,client->username);
 				client->state = AUTHENTICATED;
+				send_broadcasts(client,false,NULL);
 			}
 		} else if (client->state == AUTHENTICATED) {
-			SSL_write(client->ssl, "Command received.\n", 19);
+			if (client->buffer[0] == 'b') {
+				broadcast_message(client, client->buffer + 1);
+				SSL_write(client->ssl, "aMessage broadcasted.\n", 23);
+			} else if (client->buffer[0] == 'd') {
+				display_clients(client);
+			} else if (client->buffer[0] == 'c') {
+				int len = strlen(client->buffer);
+				if (len > 0 && client->buffer[len - 1] == '\n') {
+					client->buffer[len - 1] = '\0';
+				}
+				struct in_addr target_addr;
+				if (inet_pton(AF_INET,client->buffer + 1, &target_addr) <= 0) {
+					pthread_mutex_unlock(&client_mutex);
+					SSL_write(client->ssl, "aUser not available.\n", 22);
+					break;
+				}
+				pthread_mutex_lock(&client_mutex);
+				Client *target = NULL;
+				for (int i = 0; i < client_count; i++) {
+					if (clients[i].active && (clients[i].address.sin_addr.s_addr == target_addr.s_addr)) {
+						target = &clients[i];
+						break;
+					}
+				}
+
+				if (client == target) {
+					pthread_mutex_unlock(&client_mutex);
+					SSL_write(client->ssl, "aUser not available.\n", 22);
+					break;
+				}
+
+				if (target) {
+					char buff[1024];
+					client->state = IN_HANDOFF;
+					target->state = D_HANDOFF;
+					client->handoff = target;
+					target->handoff = client;
+					snprintf(buff, sizeof(buff),
+				"hConnection request from %s, %s. Accept (y/n)?\n",
+				client->username,
+				inet_ntoa(client->address.sin_addr)
+			);
+					SSL_write(target->ssl, buff, (int)strlen(buff));
+				} else {
+					SSL_write(client->ssl, "aUser not available.\n", 22);
+				}
+				pthread_mutex_unlock(&client_mutex);
+			}
+		} else if (client->state == D_HANDOFF) {
+			if (client->buffer[0] == 'h') {
+				if (client->buffer[1] == 'y' || client->buffer[1] == 'Y') {
+					// Accepted
+					Client *partner = client->handoff;
+					if (partner && partner->active) {
+						char buf[128];
+						snprintf(buf, sizeof(buf), "hConnect to %s:%d\n",
+							inet_ntoa(client->address.sin_addr),
+							ntohs(client->address.sin_port));
+						SSL_write(partner->ssl, buf, (int)strlen(buf));
+
+						snprintf(buf, sizeof(buf), "hConnect to %s:%d\n",
+							inet_ntoa(partner->address.sin_addr),
+							ntohs(partner->address.sin_port));
+						SSL_write(client->ssl, buf, (int)strlen(buf));
+
+						disconnect_client(partner, NULL);
+						disconnect_client(client, NULL);
+					}
+				} else {
+					// Declined
+					Client *partner = client->handoff;
+					if (partner && partner->active) {
+						SSL_write(partner->ssl, "aConnection request declined.\n", 30);
+						disconnect_client(partner, NULL);
+					}
+					client->state = AUTHENTICATED;
+				}
+			}
 		}
+
 	}
 
 	printf("[Worker] Thread exiting.\n");
 	return NULL;
 }
 
-void handle_sigint(int sig) {
+void handle_sigint(const int sig) {
 	if (sig == 15) {
 		printf("\nCaught SIGTERM. Shutting down...\n");
 	} else {
@@ -395,7 +710,7 @@ void handle_sigint(int sig) {
 	pthread_cond_broadcast(&queue_cond);
 }
 
-void createopen_db() {
+void create_open_db() {
 	char *zErrMsg = NULL;
 	if (sqlite3_open("server.db", &db)) {
 		fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(db));
@@ -454,6 +769,8 @@ void remove_client(int i) {
 	}
 
 	client->active = false;
+	db_client_inactive(client->username);
+	memset(client->username, 0, sizeof(client->username));
 
 	if (client->ssl) {
 		shutdown_ssl_gracefully(client->ssl, client->fd, 500);
@@ -545,7 +862,9 @@ void queue_client_task(void) {
 
 bool accept_incoming_connections(SSL_CTX *ssl_ctx, int server_fd) {
 	if (fds[0].revents & POLLIN) {
-		int client_fd = accept(server_fd, NULL, NULL);
+		struct sockaddr_in cli_addr;
+		socklen_t cli_len = sizeof(cli_addr);
+		const int client_fd = accept(server_fd, (struct sockaddr*)&cli_addr, &cli_len);
 		if (client_fd >= 0) {
 			if (client_count >= MAX_CLIENTS) {
 				fprintf(stderr, "[!] Max clients reached. Rejecting connection (fd: %d).\n", client_fd);
@@ -554,7 +873,7 @@ bool accept_incoming_connections(SSL_CTX *ssl_ctx, int server_fd) {
 			}
 			SSL *ssl = SSL_new(ssl_ctx);
 			SSL_set_fd(ssl, client_fd);
-			printf("[+] New client connected (fd: %d). Starting SSL handshake...\n", client_fd);
+			printf("[+] New client connected (fd: %d, %d/%d). Starting SSL handshake...\n", client_fd, client_count+1, MAX_CLIENTS);
 
 			if (SSL_accept(ssl) <= 0) {
 				fprintf(stderr, "[!] SSL_accept failed for fd %d:\n", client_fd);
@@ -567,7 +886,7 @@ bool accept_incoming_connections(SSL_CTX *ssl_ctx, int server_fd) {
 			printf("[+] SSL handshake complete (fd: %d)\n", client_fd);
 			make_non_blocking(client_fd);
 
-			if (SSL_write(ssl, "Welcome to the server!\nLogin or signup?\n", 42) <= 0) {
+			if (SSL_write(ssl, "iWelcome to the server!\nLogin or signup?\n", 42) <= 0) {
 				fprintf(stderr, "[!] SSL_write failed after handshake for fd %d:\n", client_fd);
 				ERR_print_errors_fp(stderr);
 				SSL_shutdown(ssl);
@@ -586,7 +905,7 @@ bool accept_incoming_connections(SSL_CTX *ssl_ctx, int server_fd) {
 				.buffer_len = 0,
 				.username = {0},
 				.password = {0},
-				.address = 0,
+				.address = cli_addr,
 				.active = true,
 				.login_attempts = 0
 			};
