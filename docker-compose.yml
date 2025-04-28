@@ -10,9 +10,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: chatimage:latest
+    image: chat_app_image
     container_name: chat_server
-    command: ./server
+    command: ./build/release/server
     working_dir: /app
     tty: true
     stdin_open: true
@@ -22,21 +22,16 @@ services:
     ports:
       - "4400:4400/tcp"
       - "4400:4400/udp"
-    volumes:
-      - ./build/debug:/app
-      - ./certs:/app/certs
 
   client:
-    image: chatimage:latest
-    command: tail -f /dev/null
+    image: chat_app_image
+    command: sleep 99999999
     working_dir: /app
     networks:
       - testnet
-    volumes:
-      - ./build/debug:/app
     depends_on:
       - server
     tty: true
     stdin_open: true
     deploy:
-      replicas: 2
+      replicas: 3

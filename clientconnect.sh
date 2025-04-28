@@ -15,4 +15,4 @@ if ! sudo docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
 fi
 
 echo "Attaching to ${CONTAINER_NAME} and starting ./client ..."
-sudo docker exec -it "$CONTAINER_NAME" bash -c "./client"
+sudo docker exec -it "$CONTAINER_NAME" bash -c "./build/release/client"

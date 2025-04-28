@@ -5,7 +5,7 @@
 #include <openssl/ssl.h>
 #include <stdbool.h>
 
-#define PORT 4400
+#define SERVER_PORT 4400
 #define MAX_CLIENTS 50
 #define THREAD_POOL_SIZE 5
 #define MAX_TASKS 100
@@ -90,7 +90,7 @@ int hash_and_salt(char *password, const char *salt);
 // Broadcast system
 void send_broadcasts(Client *target, bool send_to_all, const char *single_message);
 void store_broadcast(const char *sender, const char *msg_body);
-void broadcast_message(Client *sender, const char *msg_body);
+void broadcast_message(Client *sender, char *msg_body);
 void cleanup_broadcasts();
 
 // Idle check

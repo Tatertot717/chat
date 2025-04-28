@@ -7,6 +7,7 @@ RELEASE_FLAGS := -O3 -march=native
 
 SQLITE_LIBS := -lpthread -ldl -lm
 OPENSSL_LIBS := -lssl -lcrypto -lpthread
+NCURSES_LIBS := -lncurses
 
 # Definitions
 BUILD_DIR := build
@@ -42,7 +43,7 @@ SHELL_REL  := $(RELEASE_DIR)/shell
 all: debug release
 
 debug: $(CLIENT_DBG) $(SERVER_DBG) $(SHELL_REL)
-release: $(CLIENT_REL) $(SERVER_REL) $(SHELL_REL)
+release: $(CLIENT_REL) $(SERVER_REL)
 
 # Individual targets
 client: $(CLIENT_REL)
@@ -52,7 +53,7 @@ shell:  $(SHELL_REL)
 # Debug executables
 $(CLIENT_DBG): $(CLIENT_OBJS_DBG)
 	@mkdir -p $(DEBUG_DIR)
-	$(CC) -o $@ $^ $(OPENSSL_LIBS)
+	$(CC) -o $@ $^ $(OPENSSL_LIBS) $(NCURSES_LIBS)
 
 $(SERVER_DBG): $(SERVER_OBJS_DBG)
 	@mkdir -p $(DEBUG_DIR)
@@ -62,16 +63,16 @@ $(SERVER_DBG): $(SERVER_OBJS_DBG)
 # Release executables
 $(CLIENT_REL): $(CLIENT_OBJS_REL)
 	@mkdir -p $(RELEASE_DIR)
-	$(CC) -o $@ $^ $(OPENSSL_LIBS)
+	$(CC) -o $@ $^ $(OPENSSL_LIBS) $(NCURSES_LIBS)
 
 $(SERVER_REL): $(SERVER_OBJS_REL)
 	@mkdir -p $(RELEASE_DIR)
 	$(CC) -o $@ $^ $(SQLITE_LIBS) $(OPENSSL_LIBS)
+	./cert.sh
 
 $(SHELL_REL): $(SHELL_OBJS_REL)
 	@mkdir -p $(RELEASE_DIR)
 	$(CC) -o $@ $^ $(SQLITE_LIBS)
-	./cert.sh
 
 # Object file rules
 $(OBJ_DIR)/%.o: %.c
