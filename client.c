@@ -542,6 +542,7 @@ void handle_handoff_message(const char *buffer) {
 	if (handoff_mode == CONNECTOR) {
 		// Only the connector closes immediately, has to create a new socket to connect to peer
 		if (ssl) {
+			SSL_set_quiet_shutdown(ssl, 1);
 			SSL_shutdown(ssl);
 			SSL_shutdown(ssl);
 			SSL_free(ssl);
